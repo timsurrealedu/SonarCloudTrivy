@@ -1,0 +1,148 @@
+name: BNCC RnD DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  # ─────────────────────────────────────────
+  # JOB 1: Static Code Analysis (SonarCloud)
+  # ─────────────────────────────────────────
+  sonar-analysis:
+    name: "Stage 1+2: SonarCloud SAST + Quality Gate"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history diperlukan SonarCloud untuk blame analysis
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm test -- --coverage --coverageReporters=lcov --coverageReporters=text
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Quality Gate Check (BLOCK jika gagal)
+        uses: SonarSource/sonarcloud-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ─────────────────────────────────────────
+  # JOB 2: Build Docker Image
+  # ─────────────────────────────────────────
+  build-image:
+    name: "Stage 3: Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: sonar-analysis    # Hanya jalan kalau SonarCloud LOLOS
+
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: set-tag
+        run: echo "tag=bncc-demo:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ steps.set-tag.outputs.tag }} .
+
+      - name: Save image to tar
+        run: docker save ${{ steps.set-tag.outputs.tag }} -o /tmp/image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # ─────────────────────────────────────────
+  # JOB 3: Trivy Container Scan
+  # ─────────────────────────────────────────
+  trivy-scan:
+    name: "Stage 4: Trivy Vulnerability Scan"
+    runs-on: ubuntu-latest
+    needs: build-image    # Hanya jalan kalau build SUKSES
+
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load --input /tmp/image.tar
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: ${{ runner.os }}-trivy-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-trivy-
+
+      - name: Run Trivy scan (BLOCK jika CRITICAL atau HIGH)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-image.outputs.image-tag }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'         # Pipeline GAGAL jika ada temuan
+          ignore-unfixed: true   # Abaikan CVE yang belum ada patch-nya
+
+      - name: Generate JSON report (untuk arsip)
+        if: always()   # Tetap generate meski scan gagal
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-image.outputs.image-tag }}
+          format: 'json'
+          output: 'trivy-report.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          ignore-unfixed: true
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-security-report
+          path: trivy-report.json
+
+  # ─────────────────────────────────────────
+  # JOB 4: Deploy (simulasi)
+  # ─────────────────────────────────────────
+  deploy:
+    name: "Stage 5: Deploy (Simulasi)"
+    runs-on: ubuntu-latest
+    needs: [sonar-analysis, trivy-scan]   # Hanya jalan kalau SEMUA lolos
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Simulate deployment
+        run: |
+          echo "✅ Semua security check LOLOS!"
+          echo "✅ Image tag: ${{ needs.build-image.outputs.image-tag }}"
+          echo "🚀 Deploy ke production..."
+          echo "(Di setup nyata, di sini ada SSH ke VPS atau kubectl apply)"
